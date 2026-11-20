@@ -1,0 +1,13 @@
+{
+  "name": "design-calendar-board",
+  "version": "1.0.0",
+  "private": true,
+  "description": "轻量日历 / 时间轴看板，支持卡片图文、多栏、多页面、多人协作",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
