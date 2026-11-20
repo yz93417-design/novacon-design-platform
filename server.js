@@ -9,7 +9,15 @@ const path = require('path');
 const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
-const DATA_DIR = path.join(ROOT, 'data');
+const production = process.env.NODE_ENV === 'production';
+const behindGateway = process.env.TEAM_GATEWAY === '1';
+const password = process.env.TEAM_PASSWORD;
+const username = process.env.TEAM_USER || 'team';
+if (production && (!process.env.DATA_DIR || !(password || behindGateway))) {
+  throw new Error('Production requires DATA_DIR and TEAM_PASSWORD or an enforced team gateway');
+}
+const host = production || password || behindGateway ? '0.0.0.0' : '127.0.0.1';
+const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'state.json');
 const MAX_BODY = 40 * 1024 * 1024; // 40MB，图片以 dataURL 内联
 
@@ -70,29 +78,28 @@ function upgrade(raw) {
 }
 
 function loadState() {
+  let contents;
   try {
-    const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    if (!raw || !Array.isArray(raw.boards)) return emptyState();
-    if (typeof raw.version !== 'number') raw.version = 1;
-    return upgrade(raw);
-  } catch (e) {
-    const s = emptyState();
-    persist(s);
-    return s;
+    contents = fs.readFileSync(DATA_FILE, 'utf8');
+  } catch (err) {
+    if (err.code !== 'ENOENT' || production) throw err;
+    const initial = upgrade(emptyState());
+    persist(initial);
+    return initial;
   }
+  const raw = JSON.parse(contents);
+  if (!raw || !Array.isArray(raw.boards)) throw new Error('Invalid state file');
+  if (typeof raw.version !== 'number') raw.version = 1;
+  return upgrade(raw);
 }
 
 let state = loadState();
 
 function persist(s) {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const tmp = DATA_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(s));
-    fs.renameSync(tmp, DATA_FILE);
-  } catch (e) {
-    console.error('persist failed', e.message);
-  }
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = DATA_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(s), {mode: 0o600});
+  fs.renameSync(tmp, DATA_FILE);
 }
 
 function newer(a, b) {
@@ -158,6 +165,7 @@ function mergeStates(local, server) {
     systems: mergeList(local.systems, server.systems),
     channels: mergeList(local.channels, server.channels),
     designers: mergeList(local.designers, server.designers),
+    contacts: mergeList(local.contacts, server.contacts),
     issues: mergeList(local.issues, server.issues),
     gallery: mergeList(local.gallery, server.gallery),
     savedAt: Date.now(),
@@ -175,7 +183,10 @@ function sendJSON(res, code, obj) {
 }
 
 function serveStatic(req, res) {
-  let rel = decodeURIComponent(req.url.split('?')[0]);
+  let rel;
+  try { rel = decodeURIComponent(req.url.split('?')[0]); }
+  catch { return sendJSON(res, 400, {error: 'Invalid path'}); }
+  if (rel.includes('\0')) return sendJSON(res, 400, {error: 'Invalid path'});
   if (rel === '/' || rel === '') rel = '/index.html';
   const filePath = path.join(PUBLIC_DIR, path.normalize(rel).replace(/^([/\\])+/, ''));
   if (!filePath.startsWith(PUBLIC_DIR)) {
@@ -203,44 +214,56 @@ function serveStatic(req, res) {
 function readBody(req, cb) {
   let size = 0;
   const chunks = [];
-  req.on('data', (c) => {
-    size += c.length;
-    if (size > MAX_BODY) {
-      req.destroy();
-      return;
-    }
-    chunks.push(c);
+  req.on('data', (chunk) => {
+    size += chunk.length;
+    if (size <= MAX_BODY) chunks.push(chunk);
+    else chunks.length = 0;
   });
   req.on('end', () => {
-    try {
-      cb(null, JSON.parse(Buffer.concat(chunks).toString('utf8')));
-    } catch (e) {
-      cb(e);
-    }
+    if (size > MAX_BODY) return cb(413);
+    let payload;
+    try { payload = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+    catch { return cb(400); }
+    cb(null, payload);
   });
-  req.on('error', (e) => cb(e));
+  req.on('error', () => { /* connection closed */ });
+
 }
 
 const server = http.createServer((req, res) => {
   const url = req.url.split('?')[0];
 
+  if (url === '/api/health' && req.method === 'GET') return sendJSON(res, 200, {ok: true});
+  if (password && req.headers.authorization !== 'Basic ' + Buffer.from(username + ':' + password).toString('base64')) {
+    res.setHeader('WWW-Authenticate', 'Basic realm="Design team", charset="UTF-8"');
+    return sendJSON(res, 401, {error: 'Login required'});
+  }
+  if (req.method === 'POST' && (req.headers['content-type'] || '').split(';')[0] !== 'application/json') {
+    return sendJSON(res, 415, {error: 'Expected application/json'});
+  }
   if (url === '/api/state' && req.method === 'GET') {
+    const tag = '"' + state.version + '"';
+    res.setHeader('ETag', tag);
+    if (req.headers['if-none-match'] === tag) { res.writeHead(304); return res.end(); }
     return sendJSON(res, 200, state);
   }
 
   if (url === '/api/state' && req.method === 'POST') {
     return readBody(req, (err, payload) => {
       if (err || !payload || !payload.state || !Array.isArray(payload.state.boards)) {
-        return sendJSON(res, 400, { error: 'bad payload' });
+        return sendJSON(res, err || 400, { error: 'bad payload' });
       }
-      state = mergeStates(payload.state, state);
-      persist(state);
+      let next;
+      try { next = mergeStates(payload.state, state); }
+      catch { return sendJSON(res, 400, {error: 'Invalid state'}); }
+      try { persist(next); }
+      catch (err) {
+        console.error('Save failed', err.code);
+        return sendJSON(res, 503, {error: 'Save failed'});
+      }
+      state = next;
       sendJSON(res, 200, state);
     });
-  }
-
-  if (url === '/api/health') {
-    return sendJSON(res, 200, { ok: true, boards: state.boards.length, version: state.version });
   }
 
   if (req.method !== 'GET') {
@@ -250,6 +273,6 @@ const server = http.createServer((req, res) => {
   serveStatic(req, res);
 });
 
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, host, () => {
   console.log('设计排期台 listening on ' + PORT);
 });

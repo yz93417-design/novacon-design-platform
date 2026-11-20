@@ -971,81 +971,79 @@
 
   /* ---------- 保存 / 同步 ---------- */
   function touchBoard(b){ b.updatedAt = Date.now(); scheduleSave(); }
-  function scheduleSave(){
+  var revision = 0;
+  var inFlight = null;
+  function markDirty(){
+    revision++;
     saving = true;
     $sync.classList.add('saving');
     $sync.querySelector('em').textContent = '保存中';
+  }
+  function scheduleSave(){
+    markDirty();
     clearTimeout(pushTimer);
     pushTimer = setTimeout(push, 550);
   }
-  function push(){
-    return fetch('/api/state', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({state:S})
-    }).then(function(r){ return r.json(); }).then(function(next){
-      if (!next || !next.boards) return false;
-      var editing = isEditing();
-      S.version = next.version;
-      saving = false;
-      $sync.classList.remove('saving');
-      $sync.querySelector('em').textContent = '已同步';
-      if (editing) { pendingApply = true; return true; }
-      S.boards = next.boards; S.boards.forEach(ensure);
-      S.stats = Array.isArray(next.stats) ? next.stats : [];
-      S.title = next.title || S.title;
-      S.systems = Array.isArray(next.systems) ? next.systems : S.systems;
-      S.channels = Array.isArray(next.channels) ? next.channels : S.channels;
-      S.designers = Array.isArray(next.designers) ? next.designers : S.designers;
-      S.contacts = Array.isArray(next.contacts) ? next.contacts : S.contacts;
-      S.issues = Array.isArray(next.issues) ? next.issues : S.issues;
-      S.gallery = Array.isArray(next.gallery) ? next.gallery : S.gallery;
-      applySystemName();
-      renderTabs(); renderMain();
-      return true;
-    }).catch(function(){
-      saving = false;
-      $sync.classList.remove('saving');
-      $sync.querySelector('em').textContent = '网络异常';
-      return false;
+  function applySnapshot(next){
+    S.version = next.version;
+    S.boards = next.boards;
+    S.boards.forEach(ensure);
+    ['stats','systems','channels','designers','contacts','issues','gallery'].forEach(function(key){
+      if (Array.isArray(next[key])) S[key] = next[key];
     });
+    S.title = next.title || S.title;
+    applySystemName();
+    renderTabs(); renderMain();
+    if (drawerDate) renderDrawer();
   }
-  /* 立即保存（点「提交」时用），不等防抖 */
+  function push(){
+    if (inFlight) return inFlight;
+    inFlight = flush().finally(function(){ inFlight = null; });
+    return inFlight;
+  }
+  async function flush(){
+    try {
+      while (saving){
+        var sent = revision;
+        var response = await fetch('/api/state', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({state:S})});
+        if (!response.ok) throw new Error('save failed');
+        var next = await response.json();
+        if (!Array.isArray(next.boards)) throw new Error('invalid response');
+        if (revision !== sent) continue;
+        saving = false;
+        if (isEditing()) pendingApply = true;
+        else applySnapshot(next);
+        $sync.classList.remove('saving');
+        $sync.querySelector('em').textContent = '已同步';
+      }
+      return true;
+    } catch {
+      saving = true;
+      $sync.querySelector('em').textContent = '保存失败，等待重试';
+      return false;
+    }
+  }
   function pushNow(){
     clearTimeout(pushTimer);
-    saving = true;
-    $sync.classList.add('saving');
-    $sync.querySelector('em').textContent = '保存中';
+    markDirty();
     return push();
   }
-  function pull(){
-    fetch('/api/state', {cache:'no-store'}).then(function(r){ return r.json(); }).then(function(next){
-      if (!next || !next.boards) return;
-      if (next.version === S.version) return;
-      if (saving) return;
-      if (isEditing()) { pendingApply = true; return; }
-      S.version = next.version;
-      S.boards = next.boards; S.boards.forEach(ensure);
-      S.stats = Array.isArray(next.stats) ? next.stats : [];
-      S.systems = Array.isArray(next.systems) ? next.systems : S.systems;
-      S.channels = Array.isArray(next.channels) ? next.channels : S.channels;
-      S.designers = Array.isArray(next.designers) ? next.designers : S.designers;
-      S.contacts = Array.isArray(next.contacts) ? next.contacts : S.contacts;
-      S.issues = Array.isArray(next.issues) ? next.issues : S.issues;
-      S.gallery = Array.isArray(next.gallery) ? next.gallery : S.gallery;
-      applySystemName();
-      renderTabs(); renderMain();
-      if (drawerDate) renderDrawer();
-    }).catch(function(){});
+  var pulling = false;
+  async function pull(){
+    if (saving) return;
+    if (pulling || isEditing()) return;
+    pulling = true;
+    var before = revision;
+    try {
+      var response = await fetch('/api/state', {cache:'no-store', headers:{'If-None-Match':'"' + S.version + '"'}});
+      if (!response.ok || response.status === 304) return;
+      var next = await response.json();
+      if (revision === before && !saving && !isEditing() && Array.isArray(next.boards)) applySnapshot(next);
+    } catch { /* next polling interval retries */ }
+    finally { pulling = false; }
   }
   document.addEventListener('focusout', function(){
-    setTimeout(function(){
-      if (!isEditing() && pendingApply){
-        pendingApply = false;
-        renderTabs(); renderMain();
-        if (drawerDate) renderDrawer();
-      }
-    }, 60);
+    if (pendingApply) { pendingApply = false; setTimeout(pull, 60); }
   });
 
   /* ---------- 顶栏 ---------- */
@@ -4207,7 +4205,10 @@
       if (im) setTimeout(function(){ focusImage(+im[1]); }, 320);
     }, 150);
 
-    setInterval(pull, 3000);
+    setInterval(function(){
+      if (saving && !inFlight && $sync.querySelector('em').textContent === '保存失败，等待重试') push();
+      else pull();
+    }, 3000);
   }).catch(function(){
     $main.innerHTML = '<div class="empty">加载失败，请刷新页面重试。</div>';
   });
